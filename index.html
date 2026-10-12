@@ -347,7 +347,7 @@ function burst(x, y, opt) {
     });
   }
 
-  boom(cfg.vol, y);
+  boom(cfg.vol, y, kind);
 }
 
 /* 各花型的参数与方向函数 */
@@ -554,7 +554,7 @@ function render(t) {
 }
 
 /* ============================ 音效 ============================ */
-var ac = null, master = null, noiseBuf = null, muted = true;
+var ac = null, master = null, comp = null, noiseBuf = null, muted = true;
 var SOUND_OK = CFG.sound;
 
 function initAudio() {
@@ -564,13 +564,23 @@ function initAudio() {
   try {
     ac = new AC();
     master = ac.createGain();
-    master.gain.value = 0.3;
+    master.gain.value = 0.22;
     master.connect(ac.destination);
 
-    var len = Math.floor(ac.sampleRate * 0.6);
+    var len = Math.floor(ac.sampleRate * 1.5);
     noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
     var d = noiseBuf.getChannelData(0);
     for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+    // 限幅：同时炸几朵时峰值会叠到 3 倍，不压就会破音
+    // 单朵的峰值刚好在阈值附近，所以只削"齐射"，不糊正常音量
+    comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -10;
+    comp.knee.value = 12;
+    comp.ratio.value = 4;
+    comp.attack.value = 0.005;
+    comp.release.value = 0.2;
+    comp.connect(master);
   } catch (e) { ac = null; }
 }
 function resumeAudio() {
@@ -578,35 +588,78 @@ function resumeAudio() {
   if (ac.state === 'suspended' && ac.resume) ac.resume();
 }
 
-function boom(vol, y) {
-  if (!ac || muted) return;
-  var t = ac.currentTime + 0.005;
-  var far = 0.55 + 0.45 * Math.min(1, (y || H * 0.3) / (H * 0.6));  // 越低越响
+/* 从噪声缓冲区的随机位置截一段：几层声音用同一段噪声会同相叠加，
+   变成一坨而不是层次，随机错开就有"散"的感觉 */
+function noiseSrc(t, off, dur) {
+  var s = ac.createBufferSource();
+  s.buffer = noiseBuf;
+  s.playbackRate.value = rr(0.9, 1.12);
+  s.start(t, off, dur);
+  return s;
+}
+
+function boom(vol, y, kind) {
+  if (!ac || !comp || muted) return;
+
+  var t0 = ac.currentTime + 0.005;
+  var far = 0.5 + 0.5 * Math.min(1, (y || H * 0.3) / (H * 0.6));   // 越低越近、越响
   vol = Math.min(1, vol * far);
+  var off = function () { return rnd() * 0.6; };
 
-  // 低频"咚"
-  var o = ac.createOscillator(), og = ac.createGain();
+  // ① 爆裂「啪」：能量集中在 1.5~3kHz。手机小喇叭唯一还原得清楚的频段，
+  //    有它才像烟花；没有就只剩一坨闷响
+  var f1 = ac.createBiquadFilter();
+  f1.type = 'bandpass'; f1.Q.value = 0.72; f1.frequency.value = rr(1500, 3000);
+  var g1 = ac.createGain();
+  g1.gain.setValueAtTime(0, t0);
+  g1.gain.linearRampToValueAtTime(0.60 * vol, t0 + 0.003);
+  g1.gain.exponentialRampToValueAtTime(0.001, t0 + rr(0.045, 0.08));
+  noiseSrc(t0, off(), 0.12).connect(f1); f1.connect(g1); g1.connect(comp);
+
+  // ② 主体「咚」：能量压在 120~500Hz，手机喇叭放得出来
+  var f2 = ac.createBiquadFilter();
+  f2.type = 'lowpass'; f2.Q.value = 0.8;
+  f2.frequency.setValueAtTime(rr(300, 480), t0);
+  f2.frequency.exponentialRampToValueAtTime(150, t0 + 0.45);
+  var g2 = ac.createGain();
+  g2.gain.setValueAtTime(0, t0);
+  g2.gain.linearRampToValueAtTime(0.60 * vol, t0 + 0.010);
+  g2.gain.exponentialRampToValueAtTime(0.001, t0 + rr(0.34, 0.50));
+  noiseSrc(t0, off(), 0.65).connect(f2); f2.connect(g2); g2.connect(comp);
+
+  // ③ 胸腔感：定频短促正弦。关键是不扫频——一扫就成了电子下滑音
+  var o = ac.createOscillator(), g3 = ac.createGain();
   o.type = 'sine';
-  var f0 = rr(80, 130);
-  o.frequency.setValueAtTime(f0, t);
-  o.frequency.exponentialRampToValueAtTime(26, t + 0.36);
-  og.gain.setValueAtTime(0, t);
-  og.gain.linearRampToValueAtTime(0.9 * vol, t + 0.012);
-  og.gain.exponentialRampToValueAtTime(0.001, t + 0.6);
-  o.connect(og); og.connect(master);
-  o.start(t); o.stop(t + 0.65);
+  o.frequency.value = rr(72, 100);   // 别再往下压了，手机喇叭 60Hz 以下基本是失真
+  g3.gain.setValueAtTime(0, t0);
+  g3.gain.linearRampToValueAtTime(0.16 * vol, t0 + 0.008);
+  g3.gain.exponentialRampToValueAtTime(0.001, t0 + rr(0.18, 0.28));
+  o.connect(g3); g3.connect(comp);
+  o.start(t0); o.stop(t0 + 0.35);
 
-  // 爆裂噪声
-  var s = ac.createBufferSource(); s.buffer = noiseBuf;
-  var lp = ac.createBiquadFilter(); lp.type = 'lowpass';
-  lp.frequency.setValueAtTime(rr(1400, 2600), t);
-  lp.frequency.exponentialRampToValueAtTime(180, t + 0.3);
-  var ng = ac.createGain();
-  ng.gain.setValueAtTime(0, t);
-  ng.gain.linearRampToValueAtTime(0.55 * vol, t + 0.01);
-  ng.gain.exponentialRampToValueAtTime(0.001, t + 0.32);
-  s.connect(lp); lp.connect(ng); ng.connect(master);
-  s.start(t); s.stop(t + 0.4);
+  // ④ 楼群回声：延迟一点点的闷噪声，声音立刻有了空间
+  var te = t0 + rr(0.10, 0.16);
+  var f4 = ac.createBiquadFilter(); f4.type = 'lowpass'; f4.frequency.value = 260;
+  var g4 = ac.createGain();
+  g4.gain.setValueAtTime(0, te);
+  g4.gain.linearRampToValueAtTime(0.14 * vol, te + 0.03);
+  g4.gain.exponentialRampToValueAtTime(0.001, te + 0.45);
+  noiseSrc(t0, off(), 0.75).connect(f4); f4.connect(g4); g4.connect(comp);
+
+  // ⑤ 闪光菊专属：噼里啪啦的尾音
+  if (kind === 'crackle') {
+    for (var i = 0; i < 14; i++) {
+      var tk = t0 + rr(0.06, 0.62);
+      var f5 = ac.createBiquadFilter();
+      f5.type = 'bandpass';
+      f5.frequency.value = rr(2600, 6500); f5.Q.value = 1.4;
+      var g5 = ac.createGain();
+      g5.gain.setValueAtTime(0, tk);
+      g5.gain.linearRampToValueAtTime(0.13 * vol * rnd(), tk + 0.002);
+      g5.gain.exponentialRampToValueAtTime(0.001, tk + 0.02);
+      noiseSrc(tk, off(), 0.05).connect(f5); f5.connect(g5); g5.connect(comp);
+    }
+  }
 }
 
 /* ============================ 主循环 ============================ */
